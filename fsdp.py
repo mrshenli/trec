@@ -26,48 +26,6 @@ from typing import cast
 WORLD_SIZE = 2
 
 
-class FSDPWrapper(DataParallelWrapper):
-    """
-    Default data parallel wrapper, which applies data parallel to all unsharded modules.
-    """
-
-    def wrap(
-        self,
-        dmp: "DistributedModelParallel",
-        env: ShardingEnv,
-        device: torch.device,
-    ) -> None:
-        print("====== in my wrapper")
-        if isinstance(dmp._dmp_wrapped_module, DistributedDataParallel) or isinstance(
-            dmp._dmp_wrapped_module, FullyShardedDataParallel
-        ):
-            return
-        pg = env.process_group
-        if pg is None:
-            raise RuntimeError("Can only init DDP for ProcessGroup-based ShardingEnv")
-        sharded_parameter_names = {
-            key
-            for key in DistributedModelParallel._sharded_parameter_names(
-                dmp._dmp_wrapped_module
-            )
-        }
-        all_paramemeter_names = {key for key, _ in dmp.named_parameters()}
-        if sharded_parameter_names == all_paramemeter_names:
-            return
-
-
-        # initialize FSDP
-        dmp._dmp_wrapped_module = cast(
-            nn.Module,
-            # pyre-fixme[28]: Unexpected keyword argument `gradient_as_bucket_view`.
-            FullyShardedDataParallel(
-                module=dmp._dmp_wrapped_module.to(device),
-                device_id=pg.rank(),
-                ignored_modules=[dmp._dmp_wrapped_module.sparse],
-            ),
-        )
-
-
 def run(rank, world_size):
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
@@ -109,27 +67,19 @@ def run(rank, world_size):
 
     if rank == 0:
         for k, v in m.state_dict().items():
-            print("---- ", k, v.shape)
+            print("--- ", k, v.data.shape)
 
-    ######## wrap with DMP ########
+    ######## wrap with FSDP ########
 
 
 
-    plan = EmbeddingShardingPlanner(
-        topology=Topology(
-            world_size=world_size, compute_device=device.type
-        )
-    ).plan(m, get_default_sharders())
-
-    dmp = DMP(
+    fsdp = FullyShardedDataParallel(
         module=m,
-        init_data_parallel=True,
-        device=device,
-        sharders=get_default_sharders(),
-        plan=plan,
-        data_parallel_wrapper=FSDPWrapper(),
+        device_id=rank,
+        #ignored_modules=[m.sparse],
     )
-    #print(dmp)
+    if rank == 0:
+        print(fsdp)
 
     ######## run one iteration ########
 
@@ -142,14 +92,12 @@ def run(rank, world_size):
     )
 
     batch = local_batch[0].to(rank)
-    dmp(batch)[1].sum().backward()
+    fsdp(batch)[1].sum().backward()
 
-    if rank == 0:
-        sd = dmp.state_dict()
-        for k, v in sd.items():
-            print("=== ", k, v.shape)
-            if isinstance(v, nn.parameter.UninitializedParameter):
-                print("==== got uninitialized!")
+    sd = fsdp.state_dict()
+    for k, v in sd.items():
+        print("=== ", k, v.storage().size())
+        print(v)
 
 
 if __name__=="__main__":
