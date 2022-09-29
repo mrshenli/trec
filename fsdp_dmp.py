@@ -10,17 +10,58 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from torchrec.distributed.test_utils.test_model import ModelInput, TestSparseNN
 from torchrec.distributed.model_parallel import DistributedModelParallel as DMP
+from torchrec.distributed.model_parallel import DataParallelWrapper
 from torchrec.distributed.planner.planners import EmbeddingShardingPlanner
 from torchrec.distributed.planner.types import Topology
+from torchrec.distributed.types import ShardingEnv
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 
 import os
 
 
-def run(rank, world_size):
+class FSDPWrapper(DataParallelWrapper):
+    """
+    Default data parallel wrapper, which applies data parallel to all unsharded modules.
+    """
 
-    print("0000", rank, world_size)
+    def wrap(
+        self,
+        dmp: "DistributedModelParallel",
+        env: ShardingEnv,
+        device: torch.device,
+    ) -> None:
+        if isinstance(dmp._dmp_wrapped_module, DistributedDataParallel) or isinstance(
+            dmp._dmp_wrapped_module, FullyShardedDataParallel
+        ):
+            return
+        pg = env.process_group
+        if pg is None:
+            raise RuntimeError("Can only init DDP for ProcessGroup-based ShardingEnv")
+        sharded_parameter_names = {
+            key
+            for key in DistributedModelParallel._sharded_parameter_names(
+                dmp._dmp_wrapped_module
+            )
+        }
+        all_paramemeter_names = {key for key, _ in dmp.named_parameters()}
+        if sharded_parameter_names == all_paramemeter_names:
+            return
+
+
+        # initialize FSDP
+        dmp._dmp_wrapped_module = cast(
+            nn.Module,
+            # pyre-fixme[28]: Unexpected keyword argument `gradient_as_bucket_view`.
+            FSDP(
+                module=dmp._dmp_wrapped_module.to(device),
+                device_id=rank,
+                ignored_modules=[dmp._dmp_wrapped_module.sparse],
+            ),
+        )
+
+
+def run(rank, world_size):
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
     num_features = 4
@@ -51,7 +92,6 @@ def run(rank, world_size):
         for i in range(num_weighted_features)
     ]
 
-    print("1111")
     m = TestSparseNN(
         tables=tables,
         num_float_features=num_float_features,
@@ -62,27 +102,25 @@ def run(rank, world_size):
     ######## wrap with DMP ########
 
 
+
     plan = EmbeddingShardingPlanner(
         topology=Topology(
             world_size=world_size, compute_device=device.type
         )
     ).plan(m, get_default_sharders())
 
-    print(m)
-
     dmp = DMP(
         module=m,
-        init_data_parallel=True,
+        init_data_parallel=False,
         device=device,
         sharders=get_default_sharders(),
-        plan=plan
+        plan=plan,
+        data_parallel_wrapper=FSDPWrapper(),
     )
-
     print(dmp)
 
     ######## run one iteration ########
 
-    print("2222")
     _, local_batch = ModelInput.generate(
         batch_size=batch_size,
         world_size=1,
@@ -92,9 +130,7 @@ def run(rank, world_size):
     )
 
     batch = local_batch[0].to(rank)
-    print("3333")
     dmp(batch)[1].sum().backward()
-    print("4444")
 
 
 if __name__=="__main__":
