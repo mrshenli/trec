@@ -6,7 +6,14 @@ from torchrec.distributed.model_parallel import (
     DistributedModelParallel,
     get_default_sharders,
 )
-from torch.distributed.fsdp import FullyShardedDataParallel
+from torch.distributed.fsdp import FullyShardedDataParallel, StateDictType
+from torch.distributed._shard.sharded_tensor.api import ShardedTensor
+from torch.distributed._shard.checkpoint import (
+    FileSystemReader,
+    FileSystemWriter,
+    save_state_dict,
+    load_state_dict,
+)
 from torch.nn.parallel import DistributedDataParallel
 import torch.nn as nn
 
@@ -37,14 +44,12 @@ class FSDPWrapper(DataParallelWrapper):
         env: ShardingEnv,
         device: torch.device,
     ) -> None:
-        print("====== in my wrapper")
         if isinstance(dmp._dmp_wrapped_module, DistributedDataParallel) or isinstance(
             dmp._dmp_wrapped_module, FullyShardedDataParallel
         ):
             return
         pg = env.process_group
-        if pg is None:
-            raise RuntimeError("Can only init DDP for ProcessGroup-based ShardingEnv")
+        assert pg is not None
         sharded_parameter_names = {
             key
             for key in DistributedModelParallel._sharded_parameter_names(
@@ -55,11 +60,9 @@ class FSDPWrapper(DataParallelWrapper):
         if sharded_parameter_names == all_paramemeter_names:
             return
 
-
         # initialize FSDP
         dmp._dmp_wrapped_module = cast(
             nn.Module,
-            # pyre-fixme[28]: Unexpected keyword argument `gradient_as_bucket_view`.
             FullyShardedDataParallel(
                 module=dmp._dmp_wrapped_module.to(device),
                 device_id=pg.rank(),
@@ -68,7 +71,7 @@ class FSDPWrapper(DataParallelWrapper):
         )
 
 
-def run(rank, world_size):
+def run(rank, world_size, path):
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
@@ -108,12 +111,11 @@ def run(rank, world_size):
     ).to(rank)
 
     if rank == 0:
+        print("###### Original Local Model States #######")
         for k, v in m.state_dict().items():
             print("---- ", k, v.shape)
 
     ######## wrap with DMP ########
-
-
 
     plan = EmbeddingShardingPlanner(
         topology=Topology(
@@ -129,7 +131,6 @@ def run(rank, world_size):
         plan=plan,
         data_parallel_wrapper=FSDPWrapper(),
     )
-    #print(dmp)
 
     ######## run one iteration ########
 
@@ -144,16 +145,52 @@ def run(rank, world_size):
     batch = local_batch[0].to(rank)
     dmp(batch)[1].sum().backward()
 
-    if rank == 0:
-        sd = dmp.state_dict()
-        for k, v in sd.items():
-            print("=== ", k, v.shape)
-            if isinstance(v, nn.parameter.UninitializedParameter):
-                print("==== got uninitialized!")
+    #sd = dmp.state_dict()
+    writer = FileSystemWriter(path)
+    reader = FileSystemReader(path)
+    with FullyShardedDataParallel.state_dict_type(dmp, StateDictType.SHARDED_STATE_DICT):
+        state_dict = dmp.state_dict()
+        if rank == 0:
+            print("###### DMP States Before Save #######")
+            for k, v in state_dict.items():
+                if isinstance(v, ShardedTensor):
+                    print("-==- ", k, v.local_tensor().shape)
+                else:
+                    print("---- ", k, v.shape)
+
+    save_state_dict(state_dict, writer)
+
+    p_sum = 0
+    for p in dmp.parameters():
+        with torch.no_grad():
+            p_sum += p.sum()
+            p.zero_()
+            assert p.sum() == 0
+
+    with FullyShardedDataParallel.state_dict_type(dmp, StateDictType.SHARDED_STATE_DICT):
+        state_dict = dmp.state_dict()
+        load_state_dict(state_dict, reader)
+        dmp.load_state_dict(state_dict)
+        if rank == 0:
+            print("###### DMP States After Load #######")
+            for k, v in state_dict.items():
+                if isinstance(v, ShardedTensor):
+                    print("-==- ", k, v.local_tensor().shape)
+                else:
+                    print("---- ", k, v.shape)
+
+    p_sum_loaded = 0
+    for p in dmp.parameters():
+        with torch.no_grad():
+            p_sum_loaded += p.sum()
+
+    print(p_sum, p_sum_loaded)
+
+    dmp(batch)[1].sum().backward()
 
 
 if __name__=="__main__":
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29506"
 
-    mp.spawn(run, args=(WORLD_SIZE,), nprocs=WORLD_SIZE, join=True)
+    mp.spawn(run, args=(WORLD_SIZE, "./checkpoints/dmp_fsdp_sharded"), nprocs=WORLD_SIZE, join=True)
