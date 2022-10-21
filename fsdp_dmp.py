@@ -173,7 +173,7 @@ def run(rank, world_size, path):
         dmp.load_state_dict(state_dict)
         if rank == 0:
             print("###### DMP States After Load #######")
-            for k, v in state_dict.items():
+            for k, v in dmp.state_dict().items():
                 if isinstance(v, ShardedTensor):
                     print("-==- ", k, v.local_tensor().shape)
                 else:
@@ -185,6 +185,8 @@ def run(rank, world_size, path):
             p_sum_loaded += p.sum()
 
     print(p_sum, p_sum_loaded)
+
+    dmp(batch)[1].sum().backward()
 
     dmp(batch)[1].sum().backward()
 
